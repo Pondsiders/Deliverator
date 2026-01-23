@@ -1,0 +1,15 @@
+services:
+  deliverator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8079:8079"
+    environment:
+      - DOWNSTREAM_URL=http://alpha-pi:8080  # The Great Loom (production)
+    restart: unless-stopped
+    dns:
+      - ${TAILSCALE_DNS}
+      - ${PUBLIC_DNS}
+    dns_search:
+      - ${TAILSCALE_SEARCH}
