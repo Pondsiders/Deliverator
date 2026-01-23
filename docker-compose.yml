@@ -4,9 +4,9 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8079:8079"
+      - "8078:8079"  # Deliverator₂ on external port 8078
     environment:
-      - DOWNSTREAM_URL=http://alpha-pi:8080  # The Great Loom (production)
+      - DOWNSTREAM_URL=http://primer:18080  # The Great Loom (dev)
     restart: unless-stopped
     dns:
       - ${TAILSCALE_DNS}
