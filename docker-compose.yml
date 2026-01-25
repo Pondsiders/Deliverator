@@ -7,6 +7,8 @@ services:
       - "8078:8079"  # Deliverator₂ on external port 8078
     environment:
       - DOWNSTREAM_URL=http://primer:18080  # The Great Loom (dev)
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}
+      - OTEL_SERVICE_NAME=deliverator-greatloom
     restart: unless-stopped
     dns:
       - ${TAILSCALE_DNS}
