@@ -18,12 +18,19 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 import httpx
 import logfire
-from opentelemetry.propagate import extract
 
 # Initialize Logfire
 # Scrubbing disabled - too aggressive (redacts "session", "auth", etc.)
 # Our logs are authenticated with 30-day retention; acceptable risk for debugging visibility
-logfire.configure(distributed_tracing=True, scrubbing=False)
+# console=False prevents stdout pollution that breaks trace propagation
+logfire.configure(
+    service_name="deliverator-greatloom",
+    distributed_tracing=True,
+    scrubbing=False,
+    console=False,
+    send_to_logfire="if-token-present",
+)
+# instrument_httpx so outgoing requests propagate traceparent
 logfire.instrument_httpx()
 
 logger = logging.getLogger(__name__)
@@ -55,8 +62,10 @@ app = FastAPI(
     description="Pizza in thirty minutes or it's free.",
 )
 
-# Instrument FastAPI with Logfire
-logfire.instrument_fastapi(app)
+# NOTE: We intentionally do NOT use instrument_fastapi() here.
+# We create manual spans inside the handler so we can attach the parent context
+# from the traceparent we extract from the body. If we used instrument_fastapi(),
+# it would create a root span before we have a chance to extract the traceparent.
 
 
 @app.on_event("shutdown")
@@ -187,14 +196,11 @@ async def deliver(request: Request, path: str):
             pass  # Not JSON, just forward as-is
 
     # === Set up tracing ===
-    # Extract parent context from traceparent if present
-    parent_ctx = None
+    # Attach parent context from traceparent if present
+    # NOTE: logfire.attach_context() expects a simple dict like {"traceparent": "00-..."}
+    # NOT an OTel context object from extract(). This is the Logfire way.
     if traceparent:
-        parent_ctx = extract({"traceparent": traceparent})
-
-    # Attach parent context if available
-    if parent_ctx:
-        ctx_manager = logfire.attach_context(parent_ctx)
+        ctx_manager = logfire.attach_context({"traceparent": traceparent})
         ctx_manager.__enter__()
     else:
         ctx_manager = None
