@@ -10,11 +10,29 @@ import json
 import logging
 import os
 
+# Suppress the harmless "Failed to detach context" warnings from OTel BEFORE importing
+# These occur when spans cross async generator boundaries - expected behavior
+logging.getLogger("opentelemetry.context").setLevel(logging.CRITICAL)
+
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 import httpx
+import logfire
 
-logging.basicConfig(level=logging.INFO)
+# Initialize Logfire
+# Scrubbing disabled - too aggressive (redacts "session", "auth", etc.)
+# Our logs are authenticated with 30-day retention; acceptable risk for debugging visibility
+# console=False prevents stdout pollution that breaks trace propagation
+logfire.configure(
+    service_name="deliverator-greatloom",
+    distributed_tracing=True,
+    scrubbing=False,
+    console=False,
+    send_to_logfire="if-token-present",
+)
+# instrument_httpx so outgoing requests propagate traceparent
+logfire.instrument_httpx()
+
 logger = logging.getLogger(__name__)
 
 # Where we're delivering to
@@ -43,6 +61,11 @@ app = FastAPI(
     title="The Deliverator",
     description="Pizza in thirty minutes or it's free.",
 )
+
+# NOTE: We intentionally do NOT use instrument_fastapi() here.
+# We create manual spans inside the handler so we can attach the parent context
+# from the traceparent we extract from the body. If we used instrument_fastapi(),
+# it would create a root span before we have a chance to extract the traceparent.
 
 
 @app.on_event("shutdown")
@@ -146,6 +169,8 @@ async def deliver(request: Request, path: str):
     # Only process POST to messages endpoint
     is_messages = request.method == "POST" and "messages" in path
     metadata = None
+    session_id = None
+    traceparent = None
 
     if is_messages and body_bytes:
         try:
@@ -155,9 +180,19 @@ async def deliver(request: Request, path: str):
             if metadata:
                 # Promote to headers
                 if "traceparent" in metadata:
-                    headers["traceparent"] = metadata["traceparent"]
+                    traceparent = metadata["traceparent"]
+                    headers["traceparent"] = traceparent
                 if "session_id" in metadata:
-                    headers["x-session-id"] = metadata["session_id"]
+                    session_id = metadata["session_id"]
+                    headers["x-session-id"] = session_id
+                if "pattern" in metadata:
+                    headers["x-loom-pattern"] = metadata["pattern"]
+                    logger.info(f"Deliverator: pattern={metadata['pattern']}")
+                if "machine" in metadata and isinstance(metadata["machine"], dict):
+                    # Extract FQDN from machine info for the Loom
+                    fqdn = metadata["machine"].get("fqdn", "")
+                    if fqdn:
+                        headers["x-machine-name"] = fqdn
 
                 # Re-encode the cleaned body
                 body_bytes = json.dumps(body).encode()
@@ -165,39 +200,103 @@ async def deliver(request: Request, path: str):
         except json.JSONDecodeError:
             pass  # Not JSON, just forward as-is
 
-    # Forward to downstream
-    client = await get_client()
-    forward_headers = filter_headers(headers, {"traceparent", "x-session-id"} if not metadata else set())
-
-    # Add our promoted headers
-    if metadata:
-        if "traceparent" in metadata:
-            forward_headers["traceparent"] = metadata["traceparent"]
-        if "session_id" in metadata:
-            forward_headers["x-session-id"] = metadata["session_id"]
-
-    upstream_response = await client.request(
-        method=request.method,
-        url=f"/{path}",
-        headers=forward_headers,
-        content=body_bytes,
-        params=dict(request.query_params),
-    )
-
-    # Return response unchanged
-    content_type = upstream_response.headers.get("content-type", "")
-    response_headers = filter_headers(dict(upstream_response.headers), set())
-
-    if "text/event-stream" in content_type:
-        return StreamingResponse(
-            upstream_response.aiter_bytes(),
-            status_code=upstream_response.status_code,
-            headers=response_headers,
-            media_type="text/event-stream",
-        )
+    # === Set up tracing ===
+    # Attach parent context from traceparent if present
+    # NOTE: logfire.attach_context() expects a simple dict like {"traceparent": "00-..."}
+    # NOT an OTel context object from extract(). This is the Logfire way.
+    if traceparent:
+        ctx_manager = logfire.attach_context({"traceparent": traceparent})
+        ctx_manager.__enter__()
     else:
-        return Response(
-            content=upstream_response.content,
-            status_code=upstream_response.status_code,
-            headers=response_headers,
+        ctx_manager = None
+
+    # Create span for delivery
+    span_name = f"deliver: {request.method} /{path}"
+    span_attrs = {"endpoint": f"/{path}"}
+    if session_id:
+        span_attrs["session.id"] = session_id[:8]
+
+    span = logfire.span(span_name, **span_attrs)
+    span.__enter__()
+
+    if metadata:
+        logfire.info(
+            "Delivering request",
+            session=session_id[:8] if session_id else "none",
+            has_traceparent=traceparent is not None,
         )
+
+    try:
+        # Forward to downstream
+        client = await get_client()
+        forward_headers = filter_headers(headers, {"traceparent", "x-session-id"} if not metadata else set())
+
+        # Add our promoted headers
+        if metadata:
+            if traceparent:
+                forward_headers["traceparent"] = traceparent
+            if session_id:
+                forward_headers["x-session-id"] = session_id
+
+        upstream_response = await client.request(
+            method=request.method,
+            url=f"/{path}",
+            headers=forward_headers,
+            content=body_bytes,
+            params=dict(request.query_params),
+        )
+
+        # Return response unchanged
+        content_type = upstream_response.headers.get("content-type", "")
+        response_headers = filter_headers(dict(upstream_response.headers), set())
+        status_code = upstream_response.status_code
+
+        span.set_attribute("http.status_code", status_code)
+
+        if "text/event-stream" in content_type:
+            # Streaming - keep span open through the generator
+            captured_span = span
+            captured_ctx_manager = ctx_manager
+
+            async def stream_with_span():
+                try:
+                    async for chunk in upstream_response.aiter_bytes():
+                        yield chunk
+                finally:
+                    # End the span after streaming completes
+                    try:
+                        captured_span.__exit__(None, None, None)
+                    except ValueError:
+                        pass  # Cross-context detach, harmless
+                    if captured_ctx_manager:
+                        try:
+                            captured_ctx_manager.__exit__(None, None, None)
+                        except ValueError:
+                            pass  # Cross-context detach, harmless
+
+            return StreamingResponse(
+                stream_with_span(),
+                status_code=status_code,
+                headers=response_headers,
+                media_type="text/event-stream",
+            )
+        else:
+            # Non-streaming - close span immediately
+            span.__exit__(None, None, None)
+            if ctx_manager:
+                ctx_manager.__exit__(None, None, None)
+
+            return Response(
+                content=upstream_response.content,
+                status_code=status_code,
+                headers=response_headers,
+            )
+
+    except Exception as e:
+        span.record_exception(e)
+        span.set_level("error")
+        span.__exit__(None, None, None)
+        if ctx_manager:
+            ctx_manager.__exit__(None, None, None)
+        logfire.error("Deliverator error", error=str(e))
+        raise
