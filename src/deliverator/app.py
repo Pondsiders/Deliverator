@@ -188,6 +188,11 @@ async def deliver(request: Request, path: str):
                 if "pattern" in metadata:
                     headers["x-loom-pattern"] = metadata["pattern"]
                     logger.info(f"Deliverator: pattern={metadata['pattern']}")
+                if "machine" in metadata and isinstance(metadata["machine"], dict):
+                    # Extract FQDN from machine info for the Loom
+                    fqdn = metadata["machine"].get("fqdn", "")
+                    if fqdn:
+                        headers["x-machine-name"] = fqdn
 
                 # Re-encode the cleaned body
                 body_bytes = json.dumps(body).encode()
