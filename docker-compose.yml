@@ -6,9 +6,12 @@ services:
     ports:
       - "18070:8079"  # Production port
     environment:
-      - DOWNSTREAM_URL=http://host.docker.internal:18080  # Loom on same machine
+      - DOWNSTREAM_URL=http://alpha-pi:18080  # Loom on same machine via Tailscale
       - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}
       - OTEL_SERVICE_NAME=deliverator
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    dns:
+      - ${TAILSCALE_DNS}
+      - ${PUBLIC_DNS}
+    dns_search:
+      - ${TAILSCALE_SEARCH}

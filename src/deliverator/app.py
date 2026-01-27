@@ -105,6 +105,11 @@ def extract_and_strip_metadata(body: dict) -> tuple[dict | None, dict]:
 
             # Check for DELIVERATOR canary (new path)
             if DELIVERATOR_CANARY in text:
+                # Must be the actual metadata block, not a file diff mentioning it
+                # Accept any hook that can output additionalContext:
+                # UserPromptSubmit, SessionStart, PreToolUse, PostToolUse, Setup, SubagentStart
+                if "hook additional context:" not in text.lower():
+                    continue
                 try:
                     start = text.index("{")
                     end = text.rindex("}") + 1
@@ -117,7 +122,8 @@ def extract_and_strip_metadata(body: dict) -> tuple[dict | None, dict]:
             # Check for LOOM canary (legacy path)
             if LOOM_CANARY in text:
                 # Must be the actual metadata block, not a file diff mentioning it
-                if "UserPromptSubmit hook additional context:" not in text:
+                # Accept any hook that can output additionalContext
+                if "hook additional context:" not in text.lower():
                     continue
                 try:
                     start = text.index("{")
