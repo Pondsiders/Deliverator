@@ -30,6 +30,11 @@ logfire.configure(
     console=False,
     send_to_logfire="if-token-present",
 )
+
+# Instrument Python's standard logging library to flow to Logfire
+# level=INFO ensures INFO and above from all named loggers propagate to root
+logging.basicConfig(handlers=[logfire.LogfireLoggingHandler()], level=logging.INFO)
+
 # instrument_httpx so outgoing requests propagate traceparent
 logfire.instrument_httpx()
 
@@ -135,7 +140,7 @@ def extract_and_strip_metadata(body: dict) -> tuple[dict | None, dict]:
                 continue
 
     if not found_blocks:
-        return None, body
+        return None, body, None
 
     # Prefer DELIVERATOR blocks over LOOM blocks, take the last one of each type
     deliverator_blocks = [b for b in found_blocks if b[3] == "deliverator"]
@@ -144,18 +149,17 @@ def extract_and_strip_metadata(body: dict) -> tuple[dict | None, dict]:
     if deliverator_blocks:
         # Use the last DELIVERATOR block
         msg_idx, block_idx, metadata, canary_type = deliverator_blocks[-1]
-        logger.info(f"Deliverator: extracted DELIVERATOR metadata, session={metadata.get('session_id', '?')[:8]}")
     elif loom_blocks:
         # Fall back to the last LOOM block
         msg_idx, block_idx, metadata, canary_type = loom_blocks[-1]
-        logger.info(f"Deliverator: extracted LOOM metadata (legacy), session={metadata.get('session_id', '?')[:8]}")
     else:
-        return None, body
+        return None, body, None
 
     # For now, we do NOT strip the block - let the Loom handle that
     # This keeps the legacy path working while we transition
 
-    return metadata, body
+    # Return canary_type so caller can log appropriately under span
+    return metadata, body, canary_type
 
 
 def filter_headers(headers: dict, skip_keys: set[str]) -> dict:
@@ -178,10 +182,11 @@ async def deliver(request: Request, path: str):
     session_id = None
     traceparent = None
 
+    canary_type = None
     if is_messages and body_bytes:
         try:
             body = json.loads(body_bytes)
-            metadata, body = extract_and_strip_metadata(body)
+            metadata, body, canary_type = extract_and_strip_metadata(body)
 
             if metadata:
                 # Promote to headers
@@ -193,7 +198,7 @@ async def deliver(request: Request, path: str):
                     headers["x-session-id"] = session_id
                 if "pattern" in metadata:
                     headers["x-loom-pattern"] = metadata["pattern"]
-                    logger.info(f"Deliverator: pattern={metadata['pattern']}")
+                    # Note: pattern logging moved to after span creation
                 if "machine" in metadata and isinstance(metadata["machine"], dict):
                     # Extract FQDN from machine info for the Loom
                     fqdn = metadata["machine"].get("fqdn", "")
@@ -225,7 +230,14 @@ async def deliver(request: Request, path: str):
     span = logfire.span(span_name, **span_attrs)
     span.__enter__()
 
+    # Log metadata extraction results (now under the span)
+    if canary_type == "deliverator":
+        logger.info(f"Deliverator: extracted DELIVERATOR metadata, session={session_id[:8] if session_id else '?'}")
+    elif canary_type == "loom":
+        logger.info(f"Deliverator: extracted LOOM metadata (legacy), session={session_id[:8] if session_id else '?'}")
+
     if metadata:
+        logger.info(f"Deliverator: pattern={metadata.get('pattern', 'none')}")
         logfire.info(
             "Delivering request",
             session=session_id[:8] if session_id else "none",
