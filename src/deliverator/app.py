@@ -32,8 +32,8 @@ logfire.configure(
 )
 
 # Instrument Python's standard logging library to flow to Logfire
-# level=INFO ensures INFO and above from all named loggers propagate to root
-logging.basicConfig(handlers=[logfire.LogfireLoggingHandler()], level=logging.INFO)
+# level=DEBUG for debugging pattern routing issues
+logging.basicConfig(handlers=[logfire.LogfireLoggingHandler()], level=logging.DEBUG)
 
 # instrument_httpx so outgoing requests propagate traceparent
 logfire.instrument_httpx()
@@ -238,11 +238,14 @@ async def deliver(request: Request, path: str):
 
     if metadata:
         logger.info(f"Deliverator: pattern={metadata.get('pattern', 'none')}")
+        logger.debug(f"Deliverator: full metadata = {metadata}")
         logfire.info(
             "Delivering request",
             session=session_id[:8] if session_id else "none",
             has_traceparent=traceparent is not None,
         )
+    else:
+        logger.debug("Deliverator: no metadata found in request")
 
     try:
         # Forward to downstream
@@ -255,6 +258,9 @@ async def deliver(request: Request, path: str):
                 forward_headers["traceparent"] = traceparent
             if session_id:
                 forward_headers["x-session-id"] = session_id
+
+        # Log outgoing headers for debugging pattern routing
+        logger.debug(f"Deliverator: outgoing headers = {forward_headers}")
 
         upstream_response = await client.request(
             method=request.method,
