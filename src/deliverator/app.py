@@ -262,30 +262,34 @@ async def deliver(request: Request, path: str):
         # Log outgoing headers for debugging pattern routing
         logger.debug(f"Deliverator: outgoing headers = {forward_headers}")
 
-        upstream_response = await client.request(
-            method=request.method,
-            url=f"/{path}",
-            headers=forward_headers,
-            content=body_bytes,
-            params=dict(request.query_params),
-        )
+        # Check if this is a streaming request
+        is_streaming_request = False
+        if is_messages and body_bytes:
+            try:
+                parsed = json.loads(body_bytes)
+                is_streaming_request = parsed.get("stream", False)
+            except json.JSONDecodeError:
+                pass
 
-        # Return response unchanged
-        content_type = upstream_response.headers.get("content-type", "")
-        response_headers = filter_headers(dict(upstream_response.headers), set())
-        status_code = upstream_response.status_code
-
-        span.set_attribute("http.status_code", status_code)
-
-        if "text/event-stream" in content_type:
-            # Streaming - keep span open through the generator
+        if is_streaming_request:
+            # === Streaming request - use true streaming ===
+            # Use client.stream() to avoid buffering the entire response
             captured_span = span
             captured_ctx_manager = ctx_manager
 
             async def stream_with_span():
                 try:
-                    async for chunk in upstream_response.aiter_bytes():
-                        yield chunk
+                    async with client.stream(
+                        method=request.method,
+                        url=f"/{path}",
+                        headers=forward_headers,
+                        content=body_bytes,
+                        params=dict(request.query_params),
+                    ) as upstream_response:
+                        captured_span.set_attribute("http.status_code", upstream_response.status_code)
+
+                        async for chunk in upstream_response.aiter_bytes():
+                            yield chunk
                 finally:
                     # End the span after streaming completes
                     try:
@@ -300,11 +304,32 @@ async def deliver(request: Request, path: str):
 
             return StreamingResponse(
                 stream_with_span(),
-                status_code=status_code,
-                headers=response_headers,
+                status_code=200,  # Actual status comes from upstream
+                headers={
+                    "content-type": "text/event-stream",
+                    "cache-control": "no-cache",
+                    "connection": "keep-alive",
+                    "x-accel-buffering": "no",  # Disable nginx buffering
+                },
                 media_type="text/event-stream",
             )
+
         else:
+            # === Non-streaming request - buffering is fine ===
+            upstream_response = await client.request(
+                method=request.method,
+                url=f"/{path}",
+                headers=forward_headers,
+                content=body_bytes,
+                params=dict(request.query_params),
+            )
+
+            content_type = upstream_response.headers.get("content-type", "")
+            response_headers = filter_headers(dict(upstream_response.headers), set())
+            status_code = upstream_response.status_code
+
+            span.set_attribute("http.status_code", status_code)
+
             # Non-streaming - close span immediately
             span.__exit__(None, None, None)
             if ctx_manager:
