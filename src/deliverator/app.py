@@ -44,7 +44,8 @@ logger = logging.getLogger(__name__)
 DOWNSTREAM_URL = os.environ.get("DOWNSTREAM_URL", "http://localhost:8080")
 
 # The canaries that mark metadata blocks
-# We look for DELIVERATOR first (new path), fall back to LOOM (legacy)
+# Priority: ALPHA (system prompt) > DELIVERATOR (message) > LOOM (legacy message)
+ALPHA_CANARY = "ALPHA_METADATA_UlVCQkVSRFVDSw"
 DELIVERATOR_CANARY = "DELIVERATOR_METADATA_UlVCQkVSRFVDSw"
 LOOM_CANARY = "LOOM_METADATA_UlVCQkVSRFVDSw"
 
@@ -81,13 +82,42 @@ async def shutdown():
         _client = None
 
 
-def extract_and_strip_metadata(body: dict) -> tuple[dict | None, dict]:
-    """Find canary blocks, extract metadata from the LAST one found.
+def extract_and_strip_metadata(body: dict) -> tuple[dict | None, dict, str | None]:
+    """Find canary blocks, extract metadata.
 
-    Looks for DELIVERATOR_METADATA first (new path), then LOOM_METADATA (legacy).
-    Returns (metadata, cleaned_body).
+    Checks in priority order:
+    1. ALPHA_METADATA in system prompt (new Duckpond path)
+    2. DELIVERATOR_METADATA in messages (hook path)
+    3. LOOM_METADATA in messages (legacy hook path)
+
+    Returns (metadata, cleaned_body, canary_type).
     Does NOT strip the block (yet) - just extracts metadata.
     """
+    # === Check system prompt first (ALPHA_METADATA - Duckpond path) ===
+    system = body.get("system")
+    if system:
+        # System can be string or list of blocks
+        if isinstance(system, str):
+            system_text = system
+        elif isinstance(system, list):
+            system_text = " ".join(
+                b.get("text", "") for b in system
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        else:
+            system_text = ""
+
+        if ALPHA_CANARY in system_text:
+            try:
+                start = system_text.index("{")
+                end = system_text.rindex("}") + 1
+                metadata = json.loads(system_text[start:end])
+                logger.info(f"Deliverator: found ALPHA_METADATA in system prompt")
+                return metadata, body, "alpha"
+            except (ValueError, json.JSONDecodeError) as e:
+                logger.warning(f"Deliverator: failed to parse ALPHA metadata: {e}")
+
+    # === Fall back to messages (DELIVERATOR/LOOM path) ===
     messages = body.get("messages", [])
 
     # Collect all metadata blocks, keeping track of which canary
@@ -110,33 +140,44 @@ def extract_and_strip_metadata(body: dict) -> tuple[dict | None, dict]:
 
             # Check for DELIVERATOR canary (new path)
             if DELIVERATOR_CANARY in text:
-                # Must be the actual metadata block, not a file diff mentioning it
-                # Accept any hook that can output additionalContext:
-                # UserPromptSubmit, SessionStart, PreToolUse, PostToolUse, Setup, SubagentStart
-                if "hook additional context:" not in text.lower():
+                # Must be the actual metadata block, not a file diff or code mentioning it
+                # Real hook output starts with the hook name, e.g. "UserPromptSubmit hook additional context:"
+                # We check that "hook additional context:" appears near the START of the text
+                lower_text = text.lower()
+                hook_marker_pos = lower_text.find("hook additional context:")
+                if hook_marker_pos == -1 or hook_marker_pos > 100:
+                    # Not found, or found too far in (probably code/comments)
                     continue
                 try:
                     start = text.index("{")
                     end = text.rindex("}") + 1
                     metadata = json.loads(text[start:end])
+                    # Verify it's actual metadata by checking for canary key
+                    if "canary" not in metadata:
+                        continue
                     found_blocks.append((msg_idx, block_idx, metadata, "deliverator"))
                 except (ValueError, json.JSONDecodeError) as e:
-                    logger.warning(f"Deliverator: failed to parse DELIVERATOR metadata: {e}")
+                    logger.debug(f"Deliverator: skipping non-metadata block with canary string: {e}")
                 continue
 
             # Check for LOOM canary (legacy path)
             if LOOM_CANARY in text:
-                # Must be the actual metadata block, not a file diff mentioning it
-                # Accept any hook that can output additionalContext
-                if "hook additional context:" not in text.lower():
+                # Must be the actual metadata block, not a file diff or code mentioning it
+                # Real hook output starts with the hook name
+                lower_text = text.lower()
+                hook_marker_pos = lower_text.find("hook additional context:")
+                if hook_marker_pos == -1 or hook_marker_pos > 100:
                     continue
                 try:
                     start = text.index("{")
                     end = text.rindex("}") + 1
                     metadata = json.loads(text[start:end])
+                    # Verify it's actual metadata by checking for canary key
+                    if "canary" not in metadata:
+                        continue
                     found_blocks.append((msg_idx, block_idx, metadata, "loom"))
                 except (ValueError, json.JSONDecodeError) as e:
-                    logger.warning(f"Deliverator: failed to parse LOOM metadata: {e}")
+                    logger.debug(f"Deliverator: skipping non-metadata block with canary string: {e}")
                 continue
 
     if not found_blocks:
@@ -181,6 +222,7 @@ async def deliver(request: Request, path: str):
     metadata = None
     session_id = None
     traceparent = None
+    pattern = None
 
     canary_type = None
     if is_messages and body_bytes:
@@ -197,8 +239,8 @@ async def deliver(request: Request, path: str):
                     session_id = metadata["session_id"]
                     headers["x-session-id"] = session_id
                 if "pattern" in metadata:
-                    headers["x-loom-pattern"] = metadata["pattern"]
-                    # Note: pattern logging moved to after span creation
+                    pattern = metadata["pattern"]
+                    headers["x-loom-pattern"] = pattern
                 if "machine" in metadata and isinstance(metadata["machine"], dict):
                     # Extract FQDN from machine info for the Loom
                     fqdn = metadata["machine"].get("fqdn", "")
@@ -223,15 +265,22 @@ async def deliver(request: Request, path: str):
 
     # Create span for delivery
     span_name = f"deliver: {request.method} /{path}"
+
     span_attrs = {"endpoint": f"/{path}"}
     if session_id:
         span_attrs["session.id"] = session_id[:8]
+
+    # Add pattern as Logfire tag (not standard OTel, but useful for filtering)
+    if pattern:
+        span_attrs["_tags"] = [pattern]
 
     span = logfire.span(span_name, **span_attrs)
     span.__enter__()
 
     # Log metadata extraction results (now under the span)
-    if canary_type == "deliverator":
+    if canary_type == "alpha":
+        logger.info(f"Deliverator: extracted ALPHA metadata (system prompt), session={session_id[:8] if session_id else '?'}")
+    elif canary_type == "deliverator":
         logger.info(f"Deliverator: extracted DELIVERATOR metadata, session={session_id[:8] if session_id else '?'}")
     elif canary_type == "loom":
         logger.info(f"Deliverator: extracted LOOM metadata (legacy), session={session_id[:8] if session_id else '?'}")
