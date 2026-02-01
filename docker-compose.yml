@@ -5,6 +5,9 @@ services:
       dockerfile: Dockerfile
     ports:
       - "18070:8079"  # Production port
+    volumes:
+      # Mount captures directory for debug dumps
+      - /Pondside/Basement/Deliverator/captures:/Pondside/Basement/Deliverator/captures
     environment:
       - DOWNSTREAM_URL=http://alpha-pi:18080  # Loom on same machine via Tailscale
       - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}

@@ -9,6 +9,8 @@ Pizza in thirty minutes or it's free.
 import json
 import logging
 import os
+import time
+from pathlib import Path
 
 # Suppress the harmless "Failed to detach context" warnings from OTel BEFORE importing
 # These occur when spans cross async generator boundaries - expected behavior
@@ -46,6 +48,10 @@ DOWNSTREAM_URL = os.environ.get("DOWNSTREAM_URL", "http://localhost:8080")
 # The canaries that mark metadata blocks
 # Priority: ALPHA (system prompt) > DELIVERATOR (message) > LOOM (legacy message)
 ALPHA_CANARY = "ALPHA_METADATA_UlVCQkVSRFVDSw"
+
+# Debug capture mode
+DEBUG_CAPTURE_HEADER = "x-alpha-debug"
+CAPTURE_DIR = Path("/Pondside/Basement/Deliverator/captures")
 DELIVERATOR_CANARY = "DELIVERATOR_METADATA_UlVCQkVSRFVDSw"
 LOOM_CANARY = "LOOM_METADATA_UlVCQkVSRFVDSw"
 
@@ -216,6 +222,32 @@ async def deliver(request: Request, path: str):
 
     body_bytes = await request.body()
     headers = dict(request.headers)
+
+    # === Debug capture mode ===
+    if headers.get(DEBUG_CAPTURE_HEADER) == "capture":
+        try:
+            CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1000000:06d}"
+            capture_path = CAPTURE_DIR / f"{timestamp}.json"
+
+            capture_data = {
+                "timestamp": timestamp,
+                "path": path,
+                "method": request.method,
+                "headers": {k: v for k, v in headers.items() if not k.lower().startswith("authorization")},
+            }
+
+            try:
+                capture_data["body"] = json.loads(body_bytes)
+            except json.JSONDecodeError:
+                capture_data["body_raw"] = body_bytes.decode("utf-8", errors="replace")
+
+            with open(capture_path, "w") as f:
+                json.dump(capture_data, f, indent=2)
+
+            logfire.info("Debug capture", path=str(capture_path))
+        except Exception as e:
+            logfire.warning("Debug capture failed", error=str(e))
 
     # Only process POST to messages endpoint
     is_messages = request.method == "POST" and "messages" in path
